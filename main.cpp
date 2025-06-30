@@ -7,20 +7,37 @@ PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_VFPU | PSP_THREAD_ATTR_USER);
 
 static void* lli = nullptr;
 static volatile u32* mem = nullptr;
-#define meCounter         (mem[0])
-#define meStart           (mem[1])
+#define meStart           (mem[0])
+#define meStop            (mem[1])
+#define meCounter         (mem[2])
+
 // used to sync drawing
-#define syncDrawSc        (mem[2])
-#define syncDrawMe        (mem[3])
-#define syncTrue          (mem[4])
+#define syncDrawSc        (mem[3])
+#define syncDrawMe        (mem[4])
+#define syncTrue          (mem[5])
 
 #define CLOCK_CANVAS_HEIGHT   128
 #define SCR_SLICE_BUFF_SIZE   (16 * 4 * 512)
 
 static u8 scDrawBase[SCR_SLICE_BUFF_SIZE * 4] __attribute__((aligned(16)));
 
+static void meExit() {
+  meStop = 1;
+  do {
+    asm volatile("sync");
+  } while(meStop < 2);
+}
+
+u32 scThreadStop = 0;
+static void scThreadExit() {
+  scThreadStop = 1;
+  do {
+    sceKernelDelayThread(10);
+  } while (scThreadStop < 2);
+}
+
 __attribute__((noinline, aligned(4)))
-static int meLoop() {
+static void meLoop() {
   do {
     meDCacheWritebackInvalidAll();
   } while(!mem || !meStart);
@@ -43,28 +60,42 @@ static int meLoop() {
       syncDrawMe = false;
     }
     meCounter++;
-  } while(!_meExit);
-  return _meExit;
+  } while(meStop == 0);
+  meStop = 2;
+  meHalt();
 }
 
 extern char __start__me_section;
 extern char __stop__me_section;
-__attribute__((section("_me_section"), noinline, aligned(4)))
+__attribute__((section("_me_section")))
 void meHandler() {
-  vrg(0xbc100004) = 0xffffffff; // enable NMI
-  vrg(0xbc100040) = 2;          // mem
-  vrg(0xbc100050) = 0x7f;       // enable clocks: ME, AW bus RegA, RegB & Edram, DMACPlus, DMAC
-  asm volatile("sync");
-  ((FCall)_meLoop)();
+  hw(0xbc100050) = 0x0f;        // Enable ME, AW bus (RegA, RegB & Edram) clocks
+  hw(0xbc100004) = 0xffffffff;  // Enable NMIs
+  hw(0xbc100040) = 0x02;        // Allows 64MB ram
+  asm("sync");
+  
+  asm volatile(
+    "li          $k0, 0x30000000\n"
+    "mtc0        $k0, $12\n"
+    "sync\n"
+    "la          $k0, %0\n"
+    "li          $k1, 0x80000000\n"
+    "or          $k0, $k0, $k1\n"
+    "jr          $k0\n"
+    "nop\n"
+    :
+    : "i" (meLoop)
+    : "k0"
+  );
 }
 
-static int initMe() {
-  memcpy((void *)0xbfc00040, (void*)&__start__me_section, me_section_size);
-  _meLoop = CACHED_KERNEL_MASK | (u32)&meLoop;
-  meDCacheWritebackInvalidAll();
-  vrg(0xBC10004C) = 0b100;
-  asm volatile("sync");
-  vrg(0xBC10004C) = 0x0;
+static int meInit() {
+  #define me_section_size (&__stop__me_section - &__start__me_section)
+  memcpy((void *)ME_HANDLER_BASE, (void*)&__start__me_section, me_section_size);
+  sceKernelDcacheWritebackInvalidateAll();
+  // Hardware reset the media engine
+  hw(0xbc10004c) = 0x04;
+  hw(0xbc10004c) = 0x0;
   asm volatile("sync");
   return 0;
 }
@@ -166,38 +197,40 @@ int drawClockSc(unsigned int args, void *argp) {
     .lineLength = 50,
   };
   float a = 0.0f;
-  while (1) {
+  do {
     if (syncDrawSc) {
       drawClockHand(&cfg, a++);
       syncDrawSc = false;
     }
     sceKernelDelayThread(1000);
-  }
+  } while (scThreadStop == 0);
+  
+  scThreadStop = 2;
+  sceKernelExitDeleteThread(0);
   return 0;
 }
 
 int main() {
   scePowerSetClockFrequency(333, 333, 166);
 
+  sceDisplaySetFrameBuf((void*)(UNCACHED_USER_MASK | GE_EDRAM_BASE), 512, 3, PSP_DISPLAY_SETBUF_NEXTFRAME);
+  pspDebugScreenInitEx(0, PSP_DISPLAY_PIXEL_FORMAT_8888, 0);
+  pspDebugScreenSetOffset(0);
+
   if (pspSdkLoadStartModule("ms0:/PSP/GAME/me/kcall.prx", PSP_MEMORY_PARTITION_KERNEL) < 0){
-    pspDebugScreenInit();
     exitSample("Can't load the PRX, exiting...");
     return 0;
   }
 
-  kcall(&initMe);
+  kcall(&meInit);
   
-  mem = meSetUserMem(10);
+  meGetUncached32(&mem, 10);
   syncDrawSc = false;
   syncDrawMe = false;
   syncTrue = true;
 
   initLLI();
   
-  sceDisplaySetFrameBuf((void*)(0x44000000), 512, 3, PSP_DISPLAY_SETBUF_NEXTFRAME);
-  pspDebugScreenInitEx(0, PSP_DISPLAY_PIXEL_FORMAT_8888, 0);
-  pspDebugScreenSetOffset(0);
-
   const SceUID uid = sceKernelCreateThread("scClockHand", drawClockSc,
     0x20, 0x10000, PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU, 0);
   if (uid >= 0) {
@@ -218,12 +251,10 @@ int main() {
   } while(!(ctl.Buttons & PSP_CTRL_HOME));
   
   meExit();
-  sceKernelDeleteThread(uid);
-  
-  meSetUserMem(0);
+  scThreadExit();
+  meGetUncached32(&mem, 0);
   free(lli);
 
-  pspDebugScreenInit();
   exitSample("Exiting...");
   return 0;
 }
